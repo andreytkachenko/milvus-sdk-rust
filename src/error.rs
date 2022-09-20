@@ -16,7 +16,6 @@
 // For custom error handling
 // TODO
 
-use crate::collection::Error as CollectionError;
 use crate::proto::common::{ErrorCode, Status};
 use crate::schema::Error as SchemaError;
 use std::error::Error as OtherError;
@@ -32,9 +31,6 @@ pub enum Error {
 
     #[error("{0:?}")]
     Communication(#[from] CommError),
-
-    #[error("{0:?}")]
-    Collection(#[from] CollectionError),
 
     #[error("{0:?}")]
     Grpc(#[from] GrpcError),

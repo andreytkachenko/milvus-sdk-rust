@@ -118,6 +118,8 @@ pub trait Collection<'a>: IntoDataFields + FromDataFields {
     fn add(&mut self, entity: Self::Entity);
     fn len(&self) -> usize;
     fn iter_columns(&'a self) -> Self::IterColumns;
+    fn split_off(&mut self, at: usize) -> Self;
+    fn append(&mut self, other: Self);
 
     fn iter_rows(&self) -> Box<dyn Iterator<Item = Self::Entity> + '_> {
         Box::new((0..self.len()).filter_map(|idx| self.index(idx)))
@@ -127,8 +129,8 @@ pub trait Collection<'a>: IntoDataFields + FromDataFields {
         self.len() == 0
     }
 
-    fn columns() -> &'static [FieldSchema<'static>] {
-        Self::Entity::SCHEMA
+    fn columns() -> Vec<&'static FieldSchema<'static>> {
+        Self::Entity::SCHEMA.into_iter().collect()
     }
 }
 
@@ -155,6 +157,21 @@ impl FieldSchema<'static> {
             chunk_size: 0,
             dim: 0,
             max_length: 0,
+        }
+    }
+
+    #[inline]
+    pub fn estimate_size(&self) -> usize {
+        match self.dtype {
+            DataType::None => 0,
+            DataType::Int16 => 2,
+            DataType::Bool | DataType::Int8 => 1,
+            DataType::Int32 | DataType::Float => 4,
+            DataType::Int64 | DataType::Double => 8,
+            DataType::String => todo!(),
+            DataType::VarChar => self.max_length as _,
+            DataType::BinaryVector => (self.dim / 8) as _,
+            DataType::FloatVector => (self.dim * 4) as _,
         }
     }
 }
@@ -468,8 +485,16 @@ impl<'a> CollectionSchema<'a> {
         self.fields.as_ref().into_iter().any(|x| x.auto_id)
     }
 
+    #[inline]
     pub fn primary_column(&self) -> Option<&FieldSchema<'a>> {
         self.fields.iter().find(|s| s.is_primary)
+    }
+
+    #[inline]
+    pub fn vector_field(&self) -> Option<&FieldSchema<'a>> {
+        self.fields
+            .iter()
+            .find(|f| matches!(f.dtype, DataType::BinaryVector | DataType::FloatVector))
     }
 
     pub fn validate(&self) -> Result<()> {

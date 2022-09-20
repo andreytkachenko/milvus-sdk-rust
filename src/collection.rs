@@ -14,26 +14,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::data::SearchResults;
 use crate::error::{Error as SuperError, Result};
-use crate::proto::common::{ConsistencyLevel, MsgType};
+use crate::proto::common::{
+    DslType, KeyValuePair, MsgType, PlaceholderGroup, PlaceholderType, PlaceholderValue,
+};
 use crate::proto::milvus::milvus_service_client::MilvusServiceClient;
 use crate::proto::milvus::{
     CreateCollectionRequest, CreatePartitionRequest, DropCollectionRequest, FlushRequest,
     HasCollectionRequest, HasPartitionRequest, InsertRequest, LoadCollectionRequest, QueryRequest,
-    ReleaseCollectionRequest, ShowCollectionsRequest, ShowPartitionsRequest, ShowType,
+    ReleaseCollectionRequest, SearchRequest, ShowCollectionsRequest, ShowPartitionsRequest,
+    ShowType,
 };
+use crate::proto::schema::{DataType, SearchResultData};
 use crate::utils::{new_msg, status_to_result};
 use crate::{config, schema};
 
-use prost::bytes::BytesMut;
+use core::fmt;
+use prost::bytes::{BufMut, BytesMut};
 use prost::Message;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::time::Duration;
-use thiserror::Error as ThisError;
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
+
+pub use crate::proto::common::ConsistencyLevel;
 
 #[derive(Debug)]
 pub struct Partition {
@@ -315,6 +322,140 @@ impl<E: schema::Entity> Collection<E> {
         Ok(F::from_data_fields(res.fields_data).unwrap())
     }
 
+    async fn search_inner<'a, A: SearchArray>(
+        &self,
+        dsl: Option<String>,
+        query: &[A],
+        output_fields: Vec<String>,
+        partition_names: Vec<String>,
+        search_params: Vec<KeyValuePair>,
+    ) -> Result<Option<SearchResultData>> {
+        let schema = E::schema();
+        let vector_field = schema.vector_field().unwrap();
+
+        let pg = PlaceholderGroup {
+            placeholders: vec![PlaceholderValue {
+                tag: "$0".to_string(),
+                r#type: match vector_field.dtype {
+                    DataType::FloatVector => PlaceholderType::FloatVector,
+                    DataType::BinaryVector => PlaceholderType::BinaryVector,
+                    _ => PlaceholderType::None,
+                } as _,
+                values: query.into_iter().map(|a| a.serialize()).collect(),
+            }],
+        };
+
+        let res = self
+            .client
+            .clone()
+            .search(SearchRequest {
+                base: Some(new_msg(MsgType::Search)),
+                db_name: "".to_string(),
+                collection_name: self.name.to_string(),
+                dsl: dsl.unwrap_or_else(|| "".to_string()),
+                dsl_type: DslType::BoolExprV1 as _,
+                output_fields,
+                partition_names,
+                guarantee_timestamp: 0,
+                travel_timestamp: 0,
+                placeholder_group: {
+                    let mut buf = BytesMut::new();
+                    pg.encode(&mut buf)?;
+                    buf.to_vec()
+                },
+                search_params,
+                nq: 0,
+            })
+            .await?
+            .into_inner();
+
+        status_to_result(res.status)?;
+
+        Ok(res.results)
+    }
+
+    pub async fn search<'a, Exp, F, P, A>(
+        &self,
+        expr: Option<Exp>,
+        query: &[A],
+        partition_names: P,
+        params: SearchParams,
+    ) -> Result<SearchResults<'a, F>>
+    where
+        A: SearchArray,
+        Exp: ToString,
+        F: schema::Collection<'a, Entity = E> + schema::FromDataFields,
+        P: IntoIterator,
+        P::Item: ToString,
+    {
+        let schema = E::schema();
+        let vector_field = schema.vector_field().unwrap();
+        let est_row_size: usize = F::columns().iter().map(|c| c.estimate_size()).sum();
+        let max_batch_size = 1 + ((MAX_SEARCH_TRANSACTION_SIZE - 1) / est_row_size);
+
+        let output_fileds: Vec<_> = F::columns()
+            .into_iter()
+            .map(|x| x.name.to_string())
+            .collect();
+
+        let partition_names = partition_names.into_iter().map(|x| x.to_string()).collect();
+
+        let search_params = [
+            ("anns_field", vector_field.name.to_string()),
+            ("topk", format!("{}", params.top_k)),
+            ("params", format!("{{}}")),
+            ("metric_type", format!("{}", params.metric_type)),
+            ("round_decimal", format!("-1")),
+        ]
+        .into_iter()
+        .map(|(k, value)| KeyValuePair {
+            key: k.to_string(),
+            value,
+        })
+        .collect();
+
+        let mut chunks_iter = query.chunks(max_batch_size);
+        let z = chunks_iter.size_hint().1;
+        let mut collection = SearchResults::with_capacity(0);
+        let expr = expr.map(|s| s.to_string());
+
+        if let Some(1) = z {
+            if let Some(dat) = self
+                .search_inner(
+                    expr,
+                    chunks_iter.next().unwrap(),
+                    output_fileds,
+                    partition_names,
+                    search_params,
+                )
+                .await?
+            {
+                collection.append_search_result_data(dat);
+            }
+        } else {
+            let results = futures::future::join_all(chunks_iter.map(|chunk| {
+                self.search_inner(
+                    expr.clone(),
+                    chunk,
+                    output_fileds.clone(),
+                    partition_names.clone(),
+                    search_params.clone(),
+                )
+            }))
+            .await;
+
+            for res in results {
+                match res {
+                    Ok(Some(dat)) => collection.append_search_result_data(dat),
+                    Ok(None) => continue,
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+
+        Ok(collection)
+    }
+
     pub async fn insert<'a, P: Into<String>, C: schema::Collection<'a, Entity = E>>(
         &self,
         fields_data: C,
@@ -349,7 +490,139 @@ impl<E: schema::Entity> Collection<E> {
     }
 }
 
-#[derive(Debug, ThisError)]
-pub enum Error {
-    // TODO
+const MAX_SEARCH_TRANSACTION_SIZE: usize = 5 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct SearchQueryOption {
+    pub consistency_level: ConsistencyLevel,
+    pub guarantee_timestamp: u64,
+    pub travel_timestamp: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexType {
+    Flat,
+    BinFlat,
+    IvfFlat,
+    BinIvfFlat,
+    IvfPQ,
+    IvfSQ8,
+    IvfSQ8H,
+    NSG,
+    HNSW,
+    RHNSWFlat,
+    RHNSWPQ,
+    RHNSWSQ,
+    IvfHNSW,
+    ANNOY,
+    NGTPANNG,
+    NGTONNG,
+}
+
+impl fmt::Display for IndexType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Flat => "FLAT", //faiss
+                Self::BinFlat => "BIN_FLAT",
+                Self::IvfFlat => "IVF_FLAT", //faiss
+                Self::BinIvfFlat => "BIN_IVF_FLAT",
+                Self::IvfPQ => "IVF_PQ", //faiss
+                Self::IvfSQ8 => "IVF_SQ8",
+                Self::IvfSQ8H => "IVF_SQ8_HYBRID",
+                Self::NSG => "NSG",
+                Self::HNSW => "HNSW",
+                Self::RHNSWFlat => "RHNSW_FLAT",
+                Self::RHNSWPQ => "RHNSW_PQ",
+                Self::RHNSWSQ => "RHNSW_SQ",
+                Self::IvfHNSW => "IVF_HNSW",
+                Self::ANNOY => "ANNOY",
+                Self::NGTPANNG => "NGT_PANNG",
+                Self::NGTONNG => "NGT_ONNG",
+            }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricType {
+    L2,
+    Ip,
+    Hamming,
+    Jaccard,
+    Tanimoto,
+    SubStructure,
+    SuperStructure,
+}
+
+impl fmt::Display for MetricType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::L2 => "L2",
+                Self::Ip => "IP",
+                Self::Hamming => "HAMMING",
+                Self::Jaccard => "JACCARD",
+                Self::Tanimoto => "TANIMOTO",
+                Self::SubStructure => "SUBSTRUCTURE",
+                Self::SuperStructure => "SUPERSTRUCTURE",
+            }
+        )
+    }
+}
+
+pub struct SearchParams {
+    pub top_k: i32,
+    pub metric_type: MetricType,
+}
+
+pub trait SearchArray {
+    fn serialize(&self) -> Vec<u8>;
+}
+
+impl<'a> SearchArray for &'a [f32] {
+    fn serialize(&self) -> Vec<u8> {
+        let slice = self.as_ref();
+        let mut buf = BytesMut::with_capacity(slice.len() * 4);
+
+        for &f in slice {
+            buf.put_f32_le(f);
+        }
+
+        buf.into()
+    }
+}
+
+impl SearchArray for Vec<f32> {
+    fn serialize(&self) -> Vec<u8> {
+        self.as_slice().serialize()
+    }
+}
+
+impl<const C: usize> SearchArray for [f32; C] {
+    fn serialize(&self) -> Vec<u8> {
+        self.as_slice().serialize()
+    }
+}
+
+impl<'a> SearchArray for &'a [u8] {
+    fn serialize(&self) -> Vec<u8> {
+        self.to_vec()
+    }
+}
+
+impl SearchArray for Vec<u8> {
+    fn serialize(&self) -> Vec<u8> {
+        self.clone()
+    }
+}
+
+impl<const C: usize> SearchArray for [u8; C] {
+    fn serialize(&self) -> Vec<u8> {
+        self.to_vec()
+    }
 }

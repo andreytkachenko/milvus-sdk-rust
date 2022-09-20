@@ -1,11 +1,11 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, marker::PhantomData};
 
 use crate::{
     proto::schema::{
         self, field_data::Field, scalar_field::Data as ScalarData,
         vector_field::Data as VectorData, DataType, ScalarField, VectorField,
     },
-    schema::FieldSchema,
+    schema::{Collection, FieldSchema},
     value::{Value, ValueVec},
 };
 
@@ -242,4 +242,89 @@ fn get_dim_max_length(field: &Field) -> (Option<i64>, Option<i32>) {
     };
 
     (Some(dim), None) // no idea how to get max_length
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchEntry<E: 'static> {
+    pub inner: E,
+    pub score: f32,
+    // id: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchCollection<'a, C: crate::schema::Collection<'a>> {
+    pub inner: C,
+    pub scores: Vec<f32>,
+    _m: PhantomData<&'a ()>,
+}
+
+impl<'a, C: crate::schema::Collection<'a> + 'a> SearchCollection<'a, C> {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            inner: C::with_capacity(cap),
+            scores: Vec::with_capacity(cap),
+            _m: Default::default(),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = SearchEntry<<C as Collection<'a>>::Entity>> + '_ {
+        std::iter::zip(self.inner.iter_rows(), self.scores.iter())
+            .map(|(inner, &score)| SearchEntry { inner, score })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchResults<'a, C: crate::schema::Collection<'a>> {
+    inner: C,
+    scores: Vec<f32>,
+    topks: Vec<i64>,
+    count: usize,
+    _m: PhantomData<&'a ()>,
+}
+
+impl<'a, C: crate::schema::Collection<'a>> SearchResults<'a, C> {
+    pub fn append_search_result_data(&mut self, dat: schema::SearchResultData) {
+        let batch = if let Some(batch) = C::from_data_fields(dat.fields_data) {
+            batch
+        } else {
+            return;
+        };
+
+        self.inner.append(batch);
+        self.scores.extend_from_slice(&dat.scores);
+        self.topks.extend_from_slice(&dat.topks);
+        self.count += dat.num_queries as usize;
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            inner: C::with_capacity(cap),
+            scores: Vec::with_capacity(cap),
+            topks: Vec::with_capacity(cap),
+            count: 0,
+            _m: Default::default(),
+        }
+    }
+
+    pub fn into_iter(mut self) -> impl Iterator<Item = SearchCollection<'a, C>> {
+        std::iter::from_fn(move || self.pop())
+    }
+
+    pub fn index(&self) -> Option<C> {
+        unimplemented!()
+    }
+
+    pub fn pop(&mut self) -> Option<SearchCollection<'a, C>> {
+        let n = self.topks.pop()? as usize;
+
+        self.count -= 1;
+        let scores = self.scores.split_off(self.scores.len() - n);
+        let inner = self.inner.split_off(self.inner.len() - n);
+
+        Some(SearchCollection {
+            inner,
+            scores,
+            _m: Default::default(),
+        })
+    }
 }

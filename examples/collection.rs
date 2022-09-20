@@ -1,7 +1,7 @@
 use milvus::{
     client::Client,
-    collection::Collection,
-    data::{FieldColumn, FromField},
+    collection::{Collection, SearchParams},
+    data::{FieldColumn, FromField, SearchResults},
     error::Error,
     schema::Collection as _,
     schema::{self, Entity, FieldSchema},
@@ -137,12 +137,31 @@ impl<'a> schema::Collection<'a> for ImageBatch {
         })
     }
 
+    fn split_off(&mut self, at: usize) -> Self {
+        let schm = <Self::Entity as Entity>::SCHEMA;
+        let hash_size = schm[1].dim as usize / 8;
+
+        Self {
+            id: self.id.split_off(at),
+            hash: self.hash.split_off(at * hash_size),
+            listing_id: self.listing_id.split_off(at),
+            provider: self.provider.split_off(at),
+        }
+    }
+
     fn iter_columns(&self) -> Self::IterColumns {
         unimplemented!()
     }
 
     fn len(&self) -> usize {
         self.id.len()
+    }
+
+    fn append(&mut self, other: Self) {
+        self.id.extend_from_slice(&other.id);
+        self.hash.extend_from_slice(&other.hash);
+        self.provider.extend_from_slice(&other.provider);
+        self.listing_id.extend_from_slice(&other.listing_id);
     }
 }
 
@@ -220,6 +239,17 @@ impl<'a> schema::Collection<'a> for ImageQueryResult {
         })
     }
 
+    fn split_off(&mut self, at: usize) -> Self {
+        let schm = <Self::Entity as Entity>::SCHEMA;
+        let hash_size = schm[1].dim as usize / 8;
+
+        Self {
+            id: self.id.split_off(at),
+            hash: self.hash.split_off(at * hash_size),
+            listing_id: self.listing_id.split_off(at),
+        }
+    }
+
     fn iter_columns(&self) -> Self::IterColumns {
         unimplemented!()
     }
@@ -227,6 +257,127 @@ impl<'a> schema::Collection<'a> for ImageQueryResult {
     fn len(&self) -> usize {
         self.id.len()
     }
+
+    fn append(&mut self, other: Self) {
+        self.id.extend_from_slice(&other.id);
+        self.hash.extend_from_slice(&other.hash);
+        self.listing_id.extend_from_slice(&other.listing_id);
+    }
+
+    fn columns() -> Vec<&'static FieldSchema<'static>> {
+        vec![
+            &Self::Entity::SCHEMA[0],
+            &Self::Entity::SCHEMA[1],
+            &Self::Entity::SCHEMA[2],
+        ]
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImageSearchResult {
+    id: Vec<i64>,
+    provider: Vec<i8>,
+    listing_id: Vec<i32>,
+}
+
+impl schema::IntoDataFields for ImageSearchResult {
+    fn into_data_fields(self) -> Vec<schema::FieldData> {
+        let scm = <Self as schema::Collection>::Entity::SCHEMA;
+        vec![
+            milvus::data::make_field_data(&scm[0], self.id),
+            milvus::data::make_field_data(&scm[2], self.listing_id),
+            milvus::data::make_field_data(&scm[3], self.provider),
+        ]
+    }
+}
+impl schema::FromDataFields for ImageSearchResult {
+    fn from_data_fields(mut fileds: Vec<schema::FieldData>) -> Option<Self> {
+        let mut this = Self::with_capacity(0);
+
+        while let Some(fld) = fileds.pop() {
+            let field = if let Some(f) = fld.field {
+                f
+            } else {
+                continue;
+            };
+
+            match fld.field_name.as_str() {
+                "id" => this.id = FromField::from_field(field)?,
+                "provider" => this.provider = FromField::from_field(field)?,
+                "listing_id" => this.listing_id = FromField::from_field(field)?,
+                _ => continue,
+            }
+        }
+
+        Some(this)
+    }
+}
+
+impl<'a> schema::Collection<'a> for ImageSearchResult {
+    type Entity = ImageEntity;
+    type IterRows = Box<dyn Iterator<Item = Self::Entity> + 'a>;
+    type IterColumns = Box<dyn Iterator<Item = FieldColumn<'static>> + 'a>;
+
+    fn with_capacity(cap: usize) -> Self {
+        let scm = <Self as schema::Collection>::Entity::SCHEMA;
+
+        Self {
+            id: Vec::with_capacity(cap * scm[0].dim as usize),
+            listing_id: Vec::with_capacity(cap * scm[2].dim as usize),
+            provider: Vec::with_capacity(cap * scm[3].dim as usize),
+        }
+    }
+
+    fn add(&mut self, entity: Self::Entity) {
+        self.id.push(entity.id);
+        self.listing_id.push(entity.listing_id);
+        self.provider.push(entity.provider);
+    }
+
+    fn index(&self, idx: usize) -> Option<Self::Entity> {
+        Some(ImageEntity {
+            id: *self.id.get(idx)? as _,
+            provider: *self.provider.get(idx)? as _,
+            listing_id: *self.listing_id.get(idx)? as _,
+            ..Default::default()
+        })
+    }
+
+    fn split_off(&mut self, at: usize) -> Self {
+        Self {
+            id: self.id.split_off(at),
+            provider: self.provider.split_off(at),
+            listing_id: self.listing_id.split_off(at),
+        }
+    }
+
+    fn iter_columns(&self) -> Self::IterColumns {
+        unimplemented!()
+    }
+
+    fn len(&self) -> usize {
+        self.id.len()
+    }
+
+    fn append(&mut self, other: Self) {
+        self.id.extend_from_slice(&other.id);
+        self.provider.extend_from_slice(&other.provider);
+        self.listing_id.extend_from_slice(&other.listing_id);
+    }
+
+    fn columns() -> Vec<&'static FieldSchema<'static>> {
+        vec![
+            &Self::Entity::SCHEMA[0],
+            &Self::Entity::SCHEMA[2],
+            &Self::Entity::SCHEMA[3],
+        ]
+    }
+}
+
+fn gen_hash() -> [u8; 32] {
+    let mut rng = rand::thread_rng();
+    let hash: [u8; 32] = rng.gen();
+    hash
 }
 
 #[tokio::main]
@@ -243,12 +394,9 @@ async fn main() -> Result<(), Error> {
     let mut batch = ImageBatch::with_capacity(1000);
 
     for i in 1..=1000 {
-        let mut rng = rand::thread_rng();
-        let hash: [u8; 32] = rng.gen();
-
         batch.add(ImageEntity {
             id: i,
-            hash: hash.to_vec(),
+            hash: gen_hash().to_vec(),
             listing_id: (i % 100) as i32,
             provider: 0,
         });
@@ -258,10 +406,30 @@ async fn main() -> Result<(), Error> {
     images.flush().await?;
     images.load_blocked(1).await?;
 
-    let x: ImageQueryResult = images.query::<_, _, [&str; 0]>("id < 200", []).await?;
+    let x: ImageQueryResult = images.query::<_, _, [&str; 0]>("id < 5", []).await?;
 
     for v in x.iter_rows() {
         println!("{:?}", v);
+    }
+
+    let y: SearchResults<ImageSearchResult> = images
+        .search::<_, _, [&str; 0], _>(
+            Option::<&str>::None,
+            &[gen_hash(), gen_hash(), gen_hash(), gen_hash(), gen_hash()],
+            [],
+            SearchParams {
+                top_k: 10,
+                metric_type: milvus::collection::MetricType::Hamming,
+            },
+        )
+        .await?;
+
+    for v in y.into_iter() {
+        println!("    ");
+
+        for c in v.iter() {
+            println!("{:?}", c);
+        }
     }
 
     Ok(())
